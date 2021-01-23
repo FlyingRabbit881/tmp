@@ -22,9 +22,12 @@
 #define APP_NAME	"live"
 
 struct RTMP_Message {
+	bool is_abs_stamp = false;
+	int chunk_id;
 	uint8_t type;
 	size_t len;
-	unsigned long timestamp;
+	unsigned long timestamp = 0;
+	uint32_t ts_field = 0;
 	uint32_t endpoint;
 	std::string buf;
 };
@@ -55,6 +58,8 @@ std::vector<Client *> clients;
 
 std::string aac_sequence_header;
 std::string avc_sequence_header;
+
+unsigned long pre_audio_pts = -1;
 
 int set_nonblock(SOCKET fd, bool enabled)
 {
@@ -161,6 +166,8 @@ void rtmp_send(Client *client, uint8_t type, uint32_t endpoint,
 		channel_num = CHAN_STREAM;
 	}
 
+	bool ext_timestamp = timestamp >= 0xFFFFFF;
+
 	RTMP_Header header;
 	header.flags = (channel_num & 0x3f) | (0 << 6);  //chf: chunk message header type = 0, chunk stream id = channel_num;
 	header.msg_type = type;
@@ -171,6 +178,11 @@ void rtmp_send(Client *client, uint8_t type, uint32_t endpoint,
 	client->send_queue.append((char *) &header, sizeof header);
 	client->written_seq += sizeof header;
 
+	uint32_t real_timestamp;
+	if (ext_timestamp) {
+
+	}
+
 	size_t pos = 0;
 	while (pos < buf.size()) {
 		if (pos) {
@@ -178,6 +190,8 @@ void rtmp_send(Client *client, uint8_t type, uint32_t endpoint,
 			client->send_queue += char(flags); //chf: chunk basic header
 
 			client->written_seq += 1;
+		}
+		if (ext_timestamp) {
 		}
 
 		size_t chunk = buf.size() - pos;
@@ -520,6 +534,12 @@ void handle_message(Client *client, RTMP_Message *msg)
 		}
 		if (msg->buf[1] == 0 && aac_sequence_header.empty())
 			aac_sequence_header.append(msg->buf, 0, msg->len);
+		else
+		{
+			if (pre_audio_pts == msg->timestamp)
+				printf("dup dup dup %u\n", msg->timestamp);
+		}
+		pre_audio_pts = msg->timestamp;
 
 		FOR_EACH(std::vector<Client *>, i, clients) {
 			Client *receiver = *i;
@@ -536,7 +556,7 @@ void handle_message(Client *client, RTMP_Message *msg)
 		}
 		client->video_count++;
 		if (client->video_count > 10)
-			client->recv_flag = false;
+			client->recv_flag = true;
 		else
 			printf("get video frame %d\n", client->video_count);
 
@@ -641,6 +661,7 @@ void do_handshake(Client *client)
 }
 #endif
 
+#if 0
 void recv_from_client(Client *client)
 {
 	std::string chunk(4096, 0);
@@ -685,22 +706,16 @@ void recv_from_client(Client *client)
 			msg->endpoint = load_le32(header.endpoint); //chf: msg stream id
 		}
 
-		if (msg->len == 0) {
-			throw std::runtime_error("message without a header");
-		}
-		size_t chunk = msg->len - msg->buf.size(); //chf: 还要多少字节消息才完整
-		if (chunk > client->chunk_len)             //chf: 每次读到的不会超过chunk_len?
-			chunk = client->chunk_len;
-
-		if (client->buf.size() < header_len + chunk) {
-			/* need more data */
-			break;
-		}
-
+		int ext = 0;
 		if (header_len >= 4) {               //type0 ~ type2
 			unsigned long ts = load_be24(header.timestamp);
 			if (ts == 0xffffff) {
-				throw std::runtime_error("ext timestamp not supported");
+				if (client->buf.size() < header_len + 4) {
+					/* need more data */
+					break;
+				}
+				ts = load_be32(client->buf.data() + header_len);
+				ext = 4;
 			}
 			if (header_len < 12) {          //type1 ~ type2时，timestamp是timestamp delta
 				ts += msg->timestamp;
@@ -708,13 +723,145 @@ void recv_from_client(Client *client)
 			msg->timestamp = ts;
 		}
 
-		msg->buf.append(client->buf, header_len, chunk); //chf: 收到的消息的chunk存入消息buf
-		client->buf.erase(0, header_len + chunk);   //chf: 删除已处理的收到的数据
+
+		if (msg->len == 0) {
+			throw std::runtime_error("message without a header");
+		}
+		size_t chunk = msg->len - msg->buf.size(); //chf: 还要多少字节消息才完整
+		if (chunk > client->chunk_len)             //chf: 每次读到的不会超过chunk_len?
+			chunk = client->chunk_len;
+
+		if (client->buf.size() < header_len + ext + chunk) {
+			/* need more data */
+			break;
+		}
+
+		msg->buf.append(client->buf, header_len + ext, chunk); //chf: 收到的消息的chunk存入消息buf
+		client->buf.erase(0, header_len + ext + chunk);   //chf: 删除已处理的收到的数据
 
 		if (msg->buf.size() == msg->len) {   //chf: 消息接收完整了
 			handle_message(client, msg);
 			msg->buf.clear();
 		}
+	}
+}
+#endif
+
+void recv_from_client(Client *client)
+{
+	std::string chunk(4096, 0);
+	int got = recv(client->fd, &chunk[0], chunk.size(), 0);
+	if (got == 0) {
+		printf("throw eof id = %d\n", client->id);
+		throw std::runtime_error("EOF from a client");
+
+	}
+	else if (got < 0) {
+		int err = WSAGetLastError();
+		if (err == 0 || err == EWOULDBLOCK || err == WSAEWOULDBLOCK)
+			return;
+		throw std::runtime_error(strf("unable to read from a client: %s",
+			strerror(errno)));
+	}
+	client->buf.append(chunk, 0, got);
+
+	while (!client->buf.empty()) {
+		int offset = 0;
+		uint8_t flags = client->buf[0];
+
+		static const size_t HEADER_LENGTH[] = { 12, 8, 4, 1 }; //chf: chunk basic header is one byte long, chunk stream id = 2-63
+		size_t header_len = HEADER_LENGTH[flags >> 6]; //chf: fmt, 4 different chunk message headers
+		int _now_chunk_id = flags & 0x3f;
+
+		switch (_now_chunk_id) {
+		case 0: {
+			//0 值表示二字节形式，并且 ID 范围 64 - 319
+			//(第二个字节 + 64)。
+			if (client->buf.size() < 2) {
+				//need more data
+				return;
+			}
+			_now_chunk_id = 64 + (uint8_t)(client->buf[1]);
+			offset = 1;
+			break;
+		}
+
+		case 1: {
+			//1 值表示三字节形式，并且 ID 范围为 64 - 65599
+			//((第三个字节) * 256 + 第二个字节 + 64)。
+			if (client->buf.size() < 3) {
+				//need more data
+				return;
+			}
+			_now_chunk_id = 64 + ((uint8_t)(client->buf[2]) << 8) + (uint8_t)(client->buf[1]);
+			offset = 2;
+			break;
+		}
+
+				//带有 2 值的块流 ID 被保留，用于下层协议控制消息和命令。
+		default: break;
+		}
+
+
+
+		if (client->buf.size() < header_len + offset) {
+			/* need more data */
+			break;
+		}
+
+		RTMP_Header &header = *((RTMP_Header *)(client->buf.data() + offset));
+		auto &chunk_data = client->messages[_now_chunk_id];
+		chunk_data.chunk_id = _now_chunk_id;
+		switch (header_len) {
+		case 12:
+			chunk_data.is_abs_stamp = true;
+			chunk_data.endpoint = load_le32(header.endpoint);
+		case 8:
+			chunk_data.len = load_be24(header.msg_len);
+			chunk_data.type = header.msg_type;
+		case 4:
+			chunk_data.ts_field = load_be24(header.timestamp);
+		}
+
+		auto time_stamp = chunk_data.ts_field;
+		if (chunk_data.ts_field == 0xFFFFFF) {
+			if (client->buf.size() < header_len + offset + 4) {
+				//need more data
+				return ;
+			}
+			time_stamp = load_be32(client->buf.data() + offset + header_len);
+			offset += 4;
+		}
+
+		if (chunk_data.len < chunk_data.buf.size()) {
+			throw std::runtime_error("非法的bodySize");
+		}
+
+		//auto more = min(_chunk_size_in, (size_t)(chunk_data.body_size - chunk_data.buffer.size()));
+		size_t more = chunk_data.len - chunk_data.buf.size(); //chf: 还要多少字节消息才完整
+		if (more > client->chunk_len)             //chf: 每次读到的不会超过chunk_len?
+			more = client->chunk_len;
+		if (client->buf.size() < header_len + offset + more) {
+			//need more data
+			return ;
+		}
+		if (more) {
+			chunk_data.buf.append(client->buf.data() + header_len + offset, more);
+		}
+	
+
+		client->buf.erase(0, header_len + offset + more);   //chf: 删除已处理的收到的数据
+
+		if (chunk_data.buf.size() == chunk_data.len) {   //chf: 消息接收完整了
+			chunk_data.timestamp = time_stamp + (chunk_data.is_abs_stamp ? 0 : chunk_data.timestamp);
+			handle_message(client, &chunk_data);
+			chunk_data.buf.clear();
+			chunk_data.is_abs_stamp = false;
+		}
+
+
+
+
 	}
 }
 
